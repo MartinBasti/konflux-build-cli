@@ -2523,6 +2523,159 @@ func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 	}
 }
 
+func Test_imagesWithExplicitPlatform(t *testing.T) {
+	g := NewWithT(t)
+
+	tests := []struct {
+		name       string
+		dockerfile string
+		expected   map[string]struct{}
+	}{
+		{
+			name:       "no platform directives",
+			dockerfile: "FROM golang:1.21\nRUN echo hello",
+			expected:   map[string]struct{}{},
+		},
+		{
+			name:       "explicit platform on FROM",
+			dockerfile: "FROM --platform=linux/amd64 golang:1.21\nRUN echo hello",
+			expected:   map[string]struct{}{"golang:1.21": {}},
+		},
+		{
+			name: "multi-stage with platform on one stage",
+			dockerfile: strings.Join([]string{
+				"FROM --platform=linux/s390x golang:1.21 AS builder",
+				"RUN echo build",
+				"",
+				"FROM registry.access.redhat.com/ubi9/ubi-minimal:latest",
+				"COPY --from=builder /app /app",
+			}, "\n"),
+			expected: map[string]struct{}{"golang:1.21": {}},
+		},
+		{
+			name:       "FROM scratch with platform is ignored",
+			dockerfile: "FROM scratch\nRUN echo hello",
+			expected:   map[string]struct{}{},
+		},
+		{
+			name: "same image with and without platform is excluded",
+			dockerfile: strings.Join([]string{
+				"FROM --platform=linux/s390x golang:1.21 AS builder",
+				"RUN echo build",
+				"",
+				"FROM golang:1.21",
+				"RUN echo run",
+			}, "\n"),
+			expected: map[string]struct{}{},
+		},
+		{
+			name:       "nil dockerfile",
+			dockerfile: "",
+			expected:   map[string]struct{}{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var df *dockerfile.Dockerfile
+			if tt.dockerfile != "" {
+				df = parseDockerfile(t, g, tt.dockerfile)
+			}
+			result := imagesWithExplicitPlatform(df)
+			g.Expect(result).To(Equal(tt.expected))
+		})
+	}
+}
+
+func Test_Build_verifyBaseImageArchitectures(t *testing.T) {
+	g := NewWithT(t)
+
+	hostArch := runtime.GOARCH
+	foreignArch := "s390x"
+	if hostArch == "s390x" {
+		foreignArch = "amd64"
+	}
+
+	tests := []struct {
+		name           string
+		images         []string
+		platformImages map[string]struct{}
+		inspectArch    map[string]string
+		expectErr      bool
+		errSubstring   string
+	}{
+		{
+			name:           "matching architecture passes",
+			images:         []string{"golang:1.21"},
+			platformImages: map[string]struct{}{},
+			inspectArch:    map[string]string{"golang:1.21": hostArch},
+			expectErr:      false,
+		},
+		{
+			name:           "wrong architecture without platform errors",
+			images:         []string{"golang:1.21"},
+			platformImages: map[string]struct{}{},
+			inspectArch:    map[string]string{"golang:1.21": foreignArch},
+			expectErr:      true,
+			errSubstring:   "Use a multi-arch image reference",
+		},
+		{
+			name:           "wrong architecture with explicit platform warns instead of erroring",
+			images:         []string{"golang:1.21"},
+			platformImages: map[string]struct{}{"golang:1.21": {}},
+			inspectArch:    map[string]string{"golang:1.21": foreignArch},
+			expectErr:      false,
+		},
+		{
+			name:           "mixed: platform image warns, non-platform image errors",
+			images:         []string{"builder:latest", "runtime:latest"},
+			platformImages: map[string]struct{}{"builder:latest": {}},
+			inspectArch: map[string]string{
+				"builder:latest": foreignArch,
+				"runtime:latest": foreignArch,
+			},
+			expectErr:    true,
+			errSubstring: "runtime:latest",
+		},
+		{
+			name:           "mixed: platform image warns, non-platform image passes",
+			images:         []string{"builder:latest", "runtime:latest"},
+			platformImages: map[string]struct{}{"builder:latest": {}},
+			inspectArch: map[string]string{
+				"builder:latest": foreignArch,
+				"runtime:latest": hostArch,
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockBuildahCli{
+				InspectImageFunc: func(name string) (cliwrappers.BuildahImageInfo, error) {
+					info := cliwrappers.BuildahImageInfo{}
+					if arch, ok := tt.inspectArch[name]; ok {
+						info.OCIv1.Architecture = arch
+					}
+					return info, nil
+				},
+			}
+
+			c := &Build{
+				CliWrappers: BuildCliWrappers{BuildahCli: mock},
+			}
+
+			err := c.verifyBaseImageArchitectures(tt.images, tt.platformImages)
+			if tt.expectErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tt.errSubstring))
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+		})
+	}
+}
+
 func Test_Build_prePullBaseImages(t *testing.T) {
 	g := NewWithT(t)
 

@@ -721,7 +721,8 @@ func (c *Build) run() error {
 		return err
 	}
 
-	if err := c.verifyBaseImageArchitectures(pulledImages); err != nil {
+	platformImages := imagesWithExplicitPlatform(containerfile)
+	if err := c.verifyBaseImageArchitectures(pulledImages, platformImages); err != nil {
 		return err
 	}
 
@@ -2187,7 +2188,10 @@ func (c *Build) prePullBaseImages(df *dockerfile.Dockerfile) ([]string, error) {
 // If the image was a multi-arch index without the correct arch, buildah pull would
 // have already failed. This check catches single-arch references, where buildah
 // silently pulls the wrong architecture.
-func (c *Build) verifyBaseImageArchitectures(images []string) error {
+//
+// Images that were referenced with an explicit --platform directive in the
+// Containerfile are exempt from the hard check — a warning is emitted instead.
+func (c *Build) verifyBaseImageArchitectures(images []string, platformImages map[string]struct{}) error {
 	hostArch := platforms.Normalize(platforms.DefaultSpec()).Architecture
 
 	for _, image := range images {
@@ -2197,6 +2201,13 @@ func (c *Build) verifyBaseImageArchitectures(images []string) error {
 			return fmt.Errorf("inspecting base image %s: %w", image, err)
 		}
 		if info.OCIv1.Architecture != hostArch {
+			if _, ok := platformImages[image]; ok {
+				l.Logger.Warnf(
+					"Base image %s has architecture '%s', expected '%s'. Cross-platform copy is a risky operation and we cannot guarantee expected results.",
+					image, info.OCIv1.Architecture, hostArch,
+				)
+				continue
+			}
 			return fmt.Errorf(
 				"base image %s has architecture '%s', expected '%s'. Use a multi-arch image reference instead of a single-architecture reference",
 				image, info.OCIv1.Architecture, hostArch,
@@ -2204,6 +2215,35 @@ func (c *Build) verifyBaseImageArchitectures(images []string) error {
 		}
 	}
 	return nil
+}
+
+// Return the set of base images whose FROM directives all have an explicit --platform flag.
+// If the same image appears in multiple FROM directives and any of them lacks --platform,
+// the image is excluded — the non-platform usage would still be an emulation build.
+//
+// The Platform field is not expanded by dockerfile-json, so a value like "$BUILDPLATFORM"
+// or "$TARGETPLATFORM" will appear as the literal variable reference — any non-empty value
+// means the user intentionally specified --platform.
+func imagesWithExplicitPlatform(df *dockerfile.Dockerfile) map[string]struct{} {
+	withPlatform := make(map[string]struct{})
+	withoutPlatform := make(map[string]struct{})
+	if df == nil {
+		return withPlatform
+	}
+	for _, stage := range df.Stages {
+		if stage.From.Image == nil {
+			continue
+		}
+		if stage.Platform != "" {
+			withPlatform[*stage.From.Image] = struct{}{}
+		} else {
+			withoutPlatform[*stage.From.Image] = struct{}{}
+		}
+	}
+	for image := range withoutPlatform {
+		delete(withPlatform, image)
+	}
+	return withPlatform
 }
 
 // Collect all images needed to build the target stage(s).

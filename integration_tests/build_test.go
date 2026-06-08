@@ -3653,6 +3653,25 @@ EOF
 			Expect(stderr).To(ContainSubstring("Use a multi-arch image reference instead of a single-architecture reference"))
 		})
 
+		t.Run("SingleArchDigestWithPlatform", func(t *testing.T) {
+			SetupGomega(t)
+
+			contextDir := setupTestContext(t)
+			imageRefByDigest := baseImageRepo + "@" + foreignArchDigest
+			writeContainerfile(contextDir, fmt.Sprintf("FROM --platform=%s %s\n", foreignArch, imageRefByDigest))
+
+			outputRef := "localhost/wrong-arch-platform:" + GenerateUniqueTag(t)
+			buildParams := BuildParams{
+				Context:   contextDir,
+				OutputRef: outputRef,
+			}
+
+			container := setupBuildContainerWithCleanup(t, buildParams, imageRegistry)
+			_, stderr, err := runBuildWithOutput(container, buildParams)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stderr).To(ContainSubstring("Cross-platform copy is a risky operation"))
+		})
+
 		t.Run("IndexWithoutHostArch", func(t *testing.T) {
 			SetupGomega(t)
 
