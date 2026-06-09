@@ -721,8 +721,7 @@ func (c *Build) run() error {
 		return err
 	}
 
-	platformImages := imagesWithExplicitPlatform(containerfile)
-	if err := c.verifyBaseImageArchitectures(pulledImages, platformImages); err != nil {
+	if err := c.verifyBaseImageArchitectures(pulledImages); err != nil {
 		return err
 	}
 
@@ -1606,6 +1605,7 @@ func (c *Build) parseContainerfile() (*dockerfile.Dockerfile, error) {
 
 	containerfile.InjectEnv(envs)
 	containerfile.Expand(argExp)
+	expandPlatformArgs(containerfile, argExp)
 	return containerfile, nil
 }
 
@@ -1648,6 +1648,30 @@ func (c *Build) createBuildArgExpander() (dockerfile.SingleWordExpander, error) 
 		return "", fmt.Errorf("not defined: $%s", word)
 	}
 	return argExp, nil
+}
+
+// dockerfile-json does not expand variable references in the Platform field of
+// FROM directives. Do it manually using resolved meta args and the build arg expander.
+func expandPlatformArgs(df *dockerfile.Dockerfile, argExp dockerfile.SingleWordExpander) {
+	metaArgs := make(map[string]string)
+	for _, arg := range df.MetaArgs {
+		if arg.Value != nil {
+			metaArgs[arg.Key] = *arg.Value
+		}
+	}
+	for _, stage := range df.Stages {
+		if stage.Platform != "" {
+			stage.Platform = os.Expand(stage.Platform, func(varname string) string {
+				if val, ok := metaArgs[varname]; ok {
+					return val
+				}
+				if val, err := argExp(varname); err == nil {
+					return val
+				}
+				return ""
+			})
+		}
+	}
 }
 
 // Parse an array of key[=value] args. If '=' is missing, look up the value in
@@ -2138,7 +2162,7 @@ func (c *Build) getImageLabels(imageRef string) (map[string]string, error) {
 // Primarily needed for hermetic builds where network access is disabled,
 // but also useful to ensure image pulls use our retry logic instead of relying on buildah.
 // Returns the list of pulled base images.
-func (c *Build) prePullBaseImages(df *dockerfile.Dockerfile) ([]string, error) {
+func (c *Build) prePullBaseImages(df *dockerfile.Dockerfile) ([]BaseImage, error) {
 	if df == nil || len(df.Stages) == 0 {
 		return nil, nil
 	}
@@ -2160,21 +2184,22 @@ func (c *Build) prePullBaseImages(df *dockerfile.Dockerfile) ([]string, error) {
 		targetStages = []int{len(df.Stages) - 1}
 	}
 
-	var pulledImages []string
+	var pulledImages []BaseImage
 
 	for _, image := range c.collectBaseImages(df, targetStages...) {
-		if !isPullableImage(image) {
-			l.Logger.Warnf("Skipping pre-pull of %s: unsupported transport", image)
+		if !isPullableImage(image.Ref) {
+			l.Logger.Warnf("Skipping pre-pull of %s: unsupported transport", image.Ref)
 			continue
 		}
-		l.Logger.Debugf("Pre-pulling base image: %s", image)
+		l.Logger.Debugf("Pre-pulling base image: %s", image.Ref)
 		if err := c.CliWrappers.BuildahCli.Pull(&cliWrappers.BuildahPullArgs{
-			Image:     image,
+			Image:     image.Ref,
+			Platform:  image.Platform,
 			HttpProxy: c.Params.ImagePullProxy,
 			NoProxy:   c.Params.ImagePullNoProxy,
 			TLSVerify: &c.Params.SrcTLSVerify,
 		}); err != nil {
-			return nil, fmt.Errorf("pre-pulling image %s: %w", image, err)
+			return nil, fmt.Errorf("pre-pulling image %s: %w", image.Ref, err)
 		}
 		pulledImages = append(pulledImages, image)
 	}
@@ -2191,59 +2216,41 @@ func (c *Build) prePullBaseImages(df *dockerfile.Dockerfile) ([]string, error) {
 //
 // Images that were referenced with an explicit --platform directive in the
 // Containerfile are exempt from the hard check — a warning is emitted instead.
-func (c *Build) verifyBaseImageArchitectures(images []string, platformImages map[string]struct{}) error {
+func (c *Build) verifyBaseImageArchitectures(images []BaseImage) error {
 	hostArch := platforms.Normalize(platforms.DefaultSpec()).Architecture
 
 	for _, image := range images {
-		_, inspectableRef := splitTransport(image)
+		_, inspectableRef := splitTransport(image.Ref)
 		info, err := c.CliWrappers.BuildahCli.InspectImage(inspectableRef)
 		if err != nil {
-			return fmt.Errorf("inspecting base image %s: %w", image, err)
+			return fmt.Errorf("inspecting base image %s: %w", image.Ref, err)
 		}
 		if info.OCIv1.Architecture != hostArch {
-			if _, ok := platformImages[image]; ok {
+			if image.Platform != "" {
 				l.Logger.Warnf(
 					"Base image %s has architecture '%s', expected '%s'. Cross-platform copy is a risky operation and we cannot guarantee expected results.",
-					image, info.OCIv1.Architecture, hostArch,
+					image.Ref, info.OCIv1.Architecture, hostArch,
 				)
 				continue
 			}
 			return fmt.Errorf(
 				"base image %s has architecture '%s', expected '%s'. Use a multi-arch image reference instead of a single-architecture reference",
-				image, info.OCIv1.Architecture, hostArch,
+				image.Ref, info.OCIv1.Architecture, hostArch,
 			)
 		}
 	}
 	return nil
 }
 
-// Return the set of base images whose FROM directives all have an explicit --platform flag.
-// If the same image appears in multiple FROM directives and any of them lacks --platform,
-// the image is excluded — the non-platform usage would still be an emulation build.
+// BaseImage holds a base image reference together with metadata from the Containerfile.
 //
-// The Platform field is not expanded by dockerfile-json, so a value like "$BUILDPLATFORM"
-// or "$TARGETPLATFORM" will appear as the literal variable reference — any non-empty value
-// means the user intentionally specified --platform.
-func imagesWithExplicitPlatform(df *dockerfile.Dockerfile) map[string]struct{} {
-	withPlatform := make(map[string]struct{})
-	withoutPlatform := make(map[string]struct{})
-	if df == nil {
-		return withPlatform
-	}
-	for _, stage := range df.Stages {
-		if stage.From.Image == nil {
-			continue
-		}
-		if stage.Platform != "" {
-			withPlatform[*stage.From.Image] = struct{}{}
-		} else {
-			withoutPlatform[*stage.From.Image] = struct{}{}
-		}
-	}
-	for image := range withoutPlatform {
-		delete(withPlatform, image)
-	}
-	return withPlatform
+// Platform is the raw --platform value from the FROM directive (e.g. "linux/amd64",
+// "$BUILDPLATFORM"). It is not expanded by dockerfile-json, so variable references
+// appear as literal strings. Any non-empty value means the user explicitly specified
+// --platform on the FROM directive.
+type BaseImage struct {
+	Ref      string
+	Platform string
 }
 
 // Collect all images needed to build the target stage(s).
@@ -2261,12 +2268,15 @@ func imagesWithExplicitPlatform(df *dockerfile.Dockerfile) map[string]struct{} {
 //
 // With skip-unused-stages=true (the default), only the target stages are of interest.
 // With skip-unused-stages=false, it's all the stages up to and including the last target stage.
-func (c *Build) collectBaseImages(df *dockerfile.Dockerfile, targetStages ...int) []string {
+//
+// The returned list may contain duplicate image refs (e.g. the same image used in
+// multiple stages with different --platform values). Each entry carries its own metadata.
+func (c *Build) collectBaseImages(df *dockerfile.Dockerfile, targetStages ...int) []BaseImage {
 	if len(targetStages) == 0 {
 		panic("need at least one target stage")
 	}
 
-	baseImageSet := make(map[string]struct{})
+	var images []BaseImage
 
 	stagesToProcess := []int{}
 	stagesSeen := make(map[int]struct{})
@@ -2295,7 +2305,7 @@ func (c *Build) collectBaseImages(df *dockerfile.Dockerfile, targetStages ...int
 		stagesToProcess = stagesToProcess[1:]
 
 		if stage.From.Image != nil {
-			baseImageSet[*stage.From.Image] = struct{}{}
+			images = append(images, BaseImage{Ref: *stage.From.Image, Platform: stage.Platform})
 		} else if stage.From.Stage != nil {
 			enqueue(stage.From.Stage.Index)
 		}
@@ -2314,12 +2324,12 @@ func (c *Build) collectBaseImages(df *dockerfile.Dockerfile, targetStages ...int
 				// ref is an image
 				// (the third option is that ref is a --build-context,
 				//  but we don't expose any way to add build contexts)
-				baseImageSet[ref] = struct{}{}
+				images = append(images, BaseImage{Ref: ref})
 			}
 		}
 	}
 
-	return slices.Sorted(maps.Keys(baseImageSet))
+	return images
 }
 
 // Given a list of containerfile stages and a string ref, determine if the ref matches any stage(s).
@@ -2483,7 +2493,7 @@ func (c *Build) writeContainerfileJson(containerfile *dockerfile.Dockerfile, out
 // (fully-qualified-name[:tag]@digest) and write the results to the specified path.
 //
 // The file format is one pair of space-separated "input-ref canonical-ref" per line.
-func (c *Build) writeResolvedBaseImages(pulledImages []string, outputPath string) error {
+func (c *Build) writeResolvedBaseImages(pulledImages []BaseImage, outputPath string) error {
 	l.Logger.Infof("Writing resolved base images to: %s", outputPath)
 
 	resolvedImages, err := c.resolveBaseImages(pulledImages)
@@ -2494,9 +2504,9 @@ func (c *Build) writeResolvedBaseImages(pulledImages []string, outputPath string
 	var s strings.Builder
 
 	for i := range pulledImages {
-		s.WriteString(pulledImages[i])
+		s.WriteString(pulledImages[i].Ref)
 		s.WriteByte(' ')
-		s.WriteString(resolvedImages[i])
+		s.WriteString(resolvedImages[i].Ref)
 		s.WriteByte('\n')
 	}
 
@@ -2508,11 +2518,11 @@ func (c *Build) writeResolvedBaseImages(pulledImages []string, outputPath string
 	return nil
 }
 
-func (c *Build) resolveBaseImages(pulledImages []string) ([]string, error) {
-	var resolvedImages []string
+func (c *Build) resolveBaseImages(pulledImages []BaseImage) ([]BaseImage, error) {
+	var resolvedImages []BaseImage
 
 	for _, image := range pulledImages {
-		_, bareImage := splitTransport(image)
+		_, bareImage := splitTransport(image.Ref)
 
 		inputRef, err := reference.Parse(bareImage)
 		if err != nil {
@@ -2522,7 +2532,7 @@ func (c *Build) resolveBaseImages(pulledImages []string) ([]string, error) {
 		_, hasDigest := inputRef.(reference.Digested)
 		if hasDigest && common.IsNormalizedRef(bareImage) {
 			l.Logger.Debugf("Resolving base images: input already canonical: %s", bareImage)
-			resolvedImages = append(resolvedImages, inputRef.String())
+			resolvedImages = append(resolvedImages, BaseImage{Ref: inputRef.String(), Platform: image.Platform})
 			continue
 		}
 
@@ -2577,7 +2587,7 @@ func (c *Build) resolveBaseImages(pulledImages []string) ([]string, error) {
 		}
 
 		l.Logger.Debugf("Resolving base images: %s resolved to %s", bareImage, resolvedRef)
-		resolvedImages = append(resolvedImages, resolvedRef.String())
+		resolvedImages = append(resolvedImages, BaseImage{Ref: resolvedRef.String(), Platform: image.Platform})
 	}
 
 	return resolvedImages, nil

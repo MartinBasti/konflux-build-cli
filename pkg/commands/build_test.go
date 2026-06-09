@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/platforms"
 	"github.com/keilerkonzept/dockerfile-json/pkg/dockerfile"
 	"github.com/konflux-ci/konflux-build-cli/pkg/cliwrappers"
 	"github.com/konflux-ci/konflux-build-cli/testutil"
@@ -2193,12 +2195,14 @@ func Test_findMatchingStages(t *testing.T) {
 func Test_Build_collectBaseImages(t *testing.T) {
 	g := NewWithT(t)
 
+	bi := func(ref string) BaseImage { return BaseImage{Ref: ref} }
+
 	tests := []struct {
 		name                 string
 		dockerfile           string
 		targetStage          int
 		dontSkipUnusedStages bool
-		expected             []string
+		expected             []BaseImage
 	}{
 		{
 			name: "FROM scratch returns empty",
@@ -2207,7 +2211,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"LABEL foo=bar",
 			}, "\n"),
 			targetStage: 0,
-			expected:    []string{},
+			expected:    []BaseImage{},
 		},
 		{
 			name: "single FROM image",
@@ -2216,7 +2220,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN echo hello",
 			}, "\n"),
 			targetStage: 0,
-			expected:    []string{"golang:1.21"},
+			expected:    []BaseImage{bi("golang:1.21")},
 		},
 		{
 			name: "COPY --from=stageName",
@@ -2228,9 +2232,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=builder /app /app",
 			}, "\n"),
 			targetStage: 1,
-			expected: []string{
-				"golang:1.21",
-				"registry.access.redhat.com/ubi9/ubi-minimal:latest",
+			expected: []BaseImage{
+				bi("registry.access.redhat.com/ubi9/ubi-minimal:latest"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2243,9 +2247,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=0 /app /app",
 			}, "\n"),
 			targetStage: 1,
-			expected: []string{
-				"golang:1.21",
-				"registry.access.redhat.com/ubi9/ubi-minimal:latest",
+			expected: []BaseImage{
+				bi("registry.access.redhat.com/ubi9/ubi-minimal:latest"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2255,7 +2259,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=busybox:latest /bin/sh /bin/sh",
 			}, "\n"),
 			targetStage: 0,
-			expected:    []string{"busybox:latest", "golang:1.21"},
+			expected:    []BaseImage{bi("golang:1.21"), bi("busybox:latest")},
 		},
 		{
 			name: "RUN --mount=from=stageName",
@@ -2267,9 +2271,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN --mount=type=bind,from=builder,source=/app,target=/app echo hello",
 			}, "\n"),
 			targetStage: 1,
-			expected: []string{
-				"alpine:3.18",
-				"golang:1.21",
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2282,9 +2286,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN --mount=type=bind,from=0,src=/app,dst=/app echo hello",
 			}, "\n"),
 			targetStage: 1,
-			expected: []string{
-				"alpine:3.18",
-				"golang:1.21",
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2294,13 +2298,13 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN --mount=type=cache,from=registry.example.com/cache:latest,target=/cache echo cached",
 			}, "\n"),
 			targetStage: 0,
-			expected: []string{
-				"golang:1.21",
-				"registry.example.com/cache:latest",
+			expected: []BaseImage{
+				bi("golang:1.21"),
+				bi("registry.example.com/cache:latest"),
 			},
 		},
 		{
-			name: "diamond dependency deduplicates shared base",
+			name: "diamond dependency collects shared base for each path",
 			dockerfile: strings.Join([]string{
 				"FROM golang:1.21 AS shared-base",
 				"RUN echo base",
@@ -2316,10 +2320,10 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=builder-b /b /b",
 			}, "\n"),
 			targetStage: 3,
-			expected: []string{
-				"alpine:3.18",
-				"golang:1.21",
-				"rust:1.70",
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				bi("rust:1.70"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2333,7 +2337,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN echo hi",
 			}, "\n"),
 			targetStage: 1,
-			expected:    []string{"alpine:3.18", "later"},
+			expected:    []BaseImage{bi("alpine:3.18"), bi("later")},
 		},
 		{
 			name: "FROM reference to later stage treated as image",
@@ -2347,7 +2351,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=later /app /app",
 			}, "\n"),
 			targetStage: 1,
-			expected:    []string{"golang:1.21", "later"},
+			expected:    []BaseImage{bi("golang:1.21"), bi("later")},
 		},
 		{
 			name: "target stage is not the last stage",
@@ -2362,9 +2366,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"RUN echo other",
 			}, "\n"),
 			targetStage: 1,
-			expected: []string{
-				"alpine:3.18",
-				"golang:1.21",
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2380,7 +2384,7 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=builder /app /app",
 			}, "\n"),
 			targetStage: 2,
-			expected:    []string{"imageA", "imageB"},
+			expected:    []BaseImage{bi("imageA"), bi("imageB")},
 		},
 		{
 			name: "unused stage not reachable from target is excluded",
@@ -2395,9 +2399,9 @@ func Test_Build_collectBaseImages(t *testing.T) {
 				"COPY --from=builder /app /app",
 			}, "\n"),
 			targetStage: 2,
-			expected: []string{
-				"alpine:3.18",
-				"golang:1.21",
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				bi("golang:1.21"),
 			},
 		},
 		{
@@ -2413,12 +2417,12 @@ func Test_Build_collectBaseImages(t *testing.T) {
 			}, "\n"),
 			targetStage:          2,
 			dontSkipUnusedStages: true,
-			expected: []string{
-				"alpine:3.18",
-				"busybox:latest",
-				"golang:1.21",
-				"registry.example.com/cache:latest",
-				"rust:1.70",
+			expected: []BaseImage{
+				bi("golang:1.21"),
+				bi("registry.example.com/cache:latest"),
+				bi("rust:1.70"),
+				bi("busybox:latest"),
+				bi("alpine:3.18"),
 			},
 		},
 		{
@@ -2432,9 +2436,24 @@ func Test_Build_collectBaseImages(t *testing.T) {
 			}, "\n"),
 			targetStage:          1,
 			dontSkipUnusedStages: true,
-			expected: []string{
-				"golang:1.21",
-				"rust:1.70",
+			expected: []BaseImage{
+				bi("golang:1.21"),
+				bi("rust:1.70"),
+			},
+		},
+		{
+			name: "FROM with explicit --platform carries platform metadata",
+			dockerfile: strings.Join([]string{
+				"FROM --platform=linux/s390x golang:1.21 AS builder",
+				"RUN echo build",
+				"",
+				"FROM alpine:3.18",
+				"COPY --from=builder /app /app",
+			}, "\n"),
+			targetStage: 1,
+			expected: []BaseImage{
+				bi("alpine:3.18"),
+				{Ref: "golang:1.21", Platform: "linux/s390x"},
 			},
 		},
 	}
@@ -2457,12 +2476,14 @@ func Test_Build_collectBaseImages(t *testing.T) {
 func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 	g := NewWithT(t)
 
+	bi := func(ref string) BaseImage { return BaseImage{Ref: ref} }
+
 	tests := []struct {
 		name                 string
 		dockerfile           string
 		targetStages         []int
 		dontSkipUnusedStages bool
-		expected             []string
+		expected             []BaseImage
 	}{
 		{
 			name: "collects images for all target stages",
@@ -2474,7 +2495,7 @@ func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 				"RUN echo second",
 			}, "\n"),
 			targetStages: []int{0, 1},
-			expected:     []string{"imageA", "imageB"},
+			expected:     []BaseImage{bi("imageA"), bi("imageB")},
 		},
 		{
 			name: "follows dependency trees of both target stages",
@@ -2492,7 +2513,7 @@ func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 				"COPY --from=dep-b /b /b",
 			}, "\n"),
 			targetStages: []int{2, 3},
-			expected:     []string{"imageA", "imageB", "imageC", "imageD"},
+			expected:     []BaseImage{bi("imageC"), bi("imageD"), bi("imageA"), bi("imageB")},
 		},
 		{
 			name: "with SkipUnusedStages=false, includes stages between non-contiguous targets",
@@ -2508,7 +2529,7 @@ func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 			}, "\n"),
 			targetStages:         []int{0, 2},
 			dontSkipUnusedStages: true,
-			expected:             []string{"imageA", "imageB", "imageC"},
+			expected:             []BaseImage{bi("imageA"), bi("imageB"), bi("imageC")},
 		},
 	}
 
@@ -2523,66 +2544,96 @@ func Test_Build_collectBaseImages_multipleTargetStages(t *testing.T) {
 	}
 }
 
-func Test_imagesWithExplicitPlatform(t *testing.T) {
+func Test_expandPlatformArgs(t *testing.T) {
 	g := NewWithT(t)
 
+	hostPlatform := platforms.Format(platforms.Normalize(platforms.DefaultSpec()))
+
 	tests := []struct {
-		name       string
-		dockerfile string
-		expected   map[string]struct{}
+		name             string
+		dockerfile       string
+		buildArgs        map[string]string
+		expectedPlatform string
 	}{
 		{
-			name:       "no platform directives",
-			dockerfile: "FROM golang:1.21\nRUN echo hello",
-			expected:   map[string]struct{}{},
-		},
-		{
-			name:       "explicit platform on FROM",
-			dockerfile: "FROM --platform=linux/amd64 golang:1.21\nRUN echo hello",
-			expected:   map[string]struct{}{"golang:1.21": {}},
-		},
-		{
-			name: "multi-stage with platform on one stage",
+			name: "literal platform is unchanged",
 			dockerfile: strings.Join([]string{
-				"FROM --platform=linux/s390x golang:1.21 AS builder",
-				"RUN echo build",
-				"",
-				"FROM registry.access.redhat.com/ubi9/ubi-minimal:latest",
-				"COPY --from=builder /app /app",
+				"FROM --platform=linux/s390x golang:1.21",
 			}, "\n"),
-			expected: map[string]struct{}{"golang:1.21": {}},
+			expectedPlatform: "linux/s390x",
 		},
 		{
-			name:       "FROM scratch with platform is ignored",
-			dockerfile: "FROM scratch\nRUN echo hello",
-			expected:   map[string]struct{}{},
-		},
-		{
-			name: "same image with and without platform is excluded",
+			name: "$BUILDPLATFORM expands to host platform",
 			dockerfile: strings.Join([]string{
-				"FROM --platform=linux/s390x golang:1.21 AS builder",
-				"RUN echo build",
-				"",
+				"FROM --platform=$BUILDPLATFORM golang:1.21",
+			}, "\n"),
+			expectedPlatform: hostPlatform,
+		},
+		{
+			name: "$TARGETPLATFORM expands to host platform",
+			dockerfile: strings.Join([]string{
+				"FROM --platform=$TARGETPLATFORM golang:1.21",
+			}, "\n"),
+			expectedPlatform: hostPlatform,
+		},
+		{
+			name: "meta arg with default value",
+			dockerfile: strings.Join([]string{
+				"ARG MYPLATFORM=linux/arm64",
+				"FROM --platform=$MYPLATFORM golang:1.21",
+			}, "\n"),
+			expectedPlatform: "linux/arm64",
+		},
+		{
+			name: "meta arg overridden by build arg",
+			dockerfile: strings.Join([]string{
+				"ARG MYPLATFORM=linux/arm64",
+				"FROM --platform=$MYPLATFORM golang:1.21",
+			}, "\n"),
+			buildArgs:        map[string]string{"MYPLATFORM": "linux/ppc64le"},
+			expectedPlatform: "linux/ppc64le",
+		},
+		{
+			name: "no platform remains empty",
+			dockerfile: strings.Join([]string{
 				"FROM golang:1.21",
-				"RUN echo run",
 			}, "\n"),
-			expected: map[string]struct{}{},
-		},
-		{
-			name:       "nil dockerfile",
-			dockerfile: "",
-			expected:   map[string]struct{}{},
+			expectedPlatform: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var df *dockerfile.Dockerfile
-			if tt.dockerfile != "" {
-				df = parseDockerfile(t, g, tt.dockerfile)
+			df := parseDockerfile(t, g, tt.dockerfile)
+
+			platform := platforms.Normalize(platforms.DefaultSpec())
+			args := map[string]string{
+				"TARGETPLATFORM": platforms.Format(platform),
+				"TARGETOS":       platform.OS,
+				"TARGETARCH":     platform.Architecture,
+				"TARGETVARIANT":  platform.Variant,
+				"BUILDPLATFORM":  platforms.Format(platform),
+				"BUILDOS":        platform.OS,
+				"BUILDARCH":      platform.Architecture,
+				"BUILDVARIANT":   platform.Variant,
 			}
-			result := imagesWithExplicitPlatform(df)
-			g.Expect(result).To(Equal(tt.expected))
+			maps.Copy(args, tt.buildArgs)
+
+			argExp := func(word string) (string, error) {
+				if value, ok := args[word]; ok {
+					return value, nil
+				}
+				return "", fmt.Errorf("not defined: $%s", word)
+			}
+
+			df.Expand(argExp)
+			expandPlatformArgs(df, argExp)
+
+			if tt.expectedPlatform == "" {
+				g.Expect(df.Stages[0].Platform).To(BeEmpty())
+			} else {
+				g.Expect(df.Stages[0].Platform).To(Equal(tt.expectedPlatform))
+			}
 		})
 	}
 }
@@ -2597,39 +2648,34 @@ func Test_Build_verifyBaseImageArchitectures(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		images         []string
-		platformImages map[string]struct{}
-		inspectArch    map[string]string
-		expectErr      bool
-		errSubstring   string
+		name         string
+		images       []BaseImage
+		inspectArch  map[string]string
+		expectErr    bool
+		errSubstring string
 	}{
 		{
-			name:           "matching architecture passes",
-			images:         []string{"golang:1.21"},
-			platformImages: map[string]struct{}{},
-			inspectArch:    map[string]string{"golang:1.21": hostArch},
-			expectErr:      false,
+			name:        "matching architecture passes",
+			images:      []BaseImage{{Ref: "golang:1.21"}},
+			inspectArch: map[string]string{"golang:1.21": hostArch},
+			expectErr:   false,
 		},
 		{
-			name:           "wrong architecture without platform errors",
-			images:         []string{"golang:1.21"},
-			platformImages: map[string]struct{}{},
-			inspectArch:    map[string]string{"golang:1.21": foreignArch},
-			expectErr:      true,
-			errSubstring:   "Use a multi-arch image reference",
+			name:         "wrong architecture without platform errors",
+			images:       []BaseImage{{Ref: "golang:1.21"}},
+			inspectArch:  map[string]string{"golang:1.21": foreignArch},
+			expectErr:    true,
+			errSubstring: "Use a multi-arch image reference",
 		},
 		{
-			name:           "wrong architecture with explicit platform warns instead of erroring",
-			images:         []string{"golang:1.21"},
-			platformImages: map[string]struct{}{"golang:1.21": {}},
-			inspectArch:    map[string]string{"golang:1.21": foreignArch},
-			expectErr:      false,
+			name:        "wrong architecture with explicit platform warns instead of erroring",
+			images:      []BaseImage{{Ref: "golang:1.21", Platform: "linux/s390x"}},
+			inspectArch: map[string]string{"golang:1.21": foreignArch},
+			expectErr:   false,
 		},
 		{
-			name:           "mixed: platform image warns, non-platform image errors",
-			images:         []string{"builder:latest", "runtime:latest"},
-			platformImages: map[string]struct{}{"builder:latest": {}},
+			name:   "mixed: platform image warns, non-platform image errors",
+			images: []BaseImage{{Ref: "builder:latest", Platform: "linux/s390x"}, {Ref: "runtime:latest"}},
 			inspectArch: map[string]string{
 				"builder:latest": foreignArch,
 				"runtime:latest": foreignArch,
@@ -2638,9 +2684,8 @@ func Test_Build_verifyBaseImageArchitectures(t *testing.T) {
 			errSubstring: "runtime:latest",
 		},
 		{
-			name:           "mixed: platform image warns, non-platform image passes",
-			images:         []string{"builder:latest", "runtime:latest"},
-			platformImages: map[string]struct{}{"builder:latest": {}},
+			name:   "mixed: platform image warns, non-platform image passes",
+			images: []BaseImage{{Ref: "builder:latest", Platform: "linux/s390x"}, {Ref: "runtime:latest"}},
 			inspectArch: map[string]string{
 				"builder:latest": foreignArch,
 				"runtime:latest": hostArch,
@@ -2665,7 +2710,7 @@ func Test_Build_verifyBaseImageArchitectures(t *testing.T) {
 				CliWrappers: BuildCliWrappers{BuildahCli: mock},
 			}
 
-			err := c.verifyBaseImageArchitectures(tt.images, tt.platformImages)
+			err := c.verifyBaseImageArchitectures(tt.images)
 			if tt.expectErr {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err.Error()).To(ContainSubstring(tt.errSubstring))
@@ -2678,6 +2723,8 @@ func Test_Build_verifyBaseImageArchitectures(t *testing.T) {
 
 func Test_Build_prePullBaseImages(t *testing.T) {
 	g := NewWithT(t)
+
+	bi := func(ref string) BaseImage { return BaseImage{Ref: ref} }
 
 	containerfile := strings.Join([]string{
 		"FROM imageA AS builder",
@@ -2692,22 +2739,22 @@ func Test_Build_prePullBaseImages(t *testing.T) {
 	tests := []struct {
 		name                 string
 		parsedBuildahVersion []int
-		expectedPulledImages []string
+		expectedPulledImages []BaseImage
 	}{
 		{
 			name:                 "buildah 1.44.0 should pull base images for all matching stages",
 			parsedBuildahVersion: []int{1, 44, 0},
-			expectedPulledImages: []string{"imageA", "imageB"},
+			expectedPulledImages: []BaseImage{bi("imageA"), bi("imageB")},
 		},
 		{
 			name:                 "buildah 2.0.0 should pull base images for all matching stages",
 			parsedBuildahVersion: []int{2, 0, 0},
-			expectedPulledImages: []string{"imageA", "imageB"},
+			expectedPulledImages: []BaseImage{bi("imageA"), bi("imageB")},
 		},
 		{
 			name:                 "buildah < 1.44.0 should pull only for first matching stage",
 			parsedBuildahVersion: []int{1, 43, 1},
-			expectedPulledImages: []string{"imageA"},
+			expectedPulledImages: []BaseImage{bi("imageA")},
 		},
 	}
 
@@ -2736,7 +2783,11 @@ func Test_Build_prePullBaseImages(t *testing.T) {
 
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(result).To(Equal(tc.expectedPulledImages))
-			g.Expect(pulledImages).To(Equal(tc.expectedPulledImages))
+			expectedRefs := make([]string, len(tc.expectedPulledImages))
+			for i, img := range tc.expectedPulledImages {
+				expectedRefs[i] = img.Ref
+			}
+			g.Expect(pulledImages).To(Equal(expectedRefs))
 		})
 	}
 }
@@ -2775,10 +2826,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 		}
 
 		input := "registry.io/namespace/image@" + digestA
-		resolved, err := c.resolveBaseImages([]string{input})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: input}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{input}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: input}}))
 		g.Expect(imagesJsonCalled).To(BeFalse())
 	})
 
@@ -2795,10 +2846,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		resolved, err := c.resolveBaseImages([]string{"namespace/image:tag"})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image:tag"}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image:tag@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image:tag@" + digestA}}))
 	})
 
 	t.Run("should resolve short name without tag", func(t *testing.T) {
@@ -2814,11 +2865,11 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		resolved, err := c.resolveBaseImages([]string{"namespace/image"})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image"}})
 
 		g.Expect(err).ToNot(HaveOccurred())
 		// No tag in output even though buildah Names has one
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image@" + digestA}}))
 	})
 
 	t.Run("should preserve tag from input not from buildah Names", func(t *testing.T) {
@@ -2834,10 +2885,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		resolved, err := c.resolveBaseImages([]string{"namespace/image:my-tag"})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image:my-tag"}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image:my-tag@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image:my-tag@" + digestA}}))
 	})
 
 	t.Run("should use digest from input when present", func(t *testing.T) {
@@ -2856,10 +2907,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 		// Input has digestA, buildah returns digestB — input wins.
 		// The only realistic situation when this can occur is if input has the manifest list digest
 		// and buildah returns the manifest digest or vice versa.
-		resolved, err := c.resolveBaseImages([]string{"namespace/image@" + digestA})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image@" + digestA}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image@" + digestA}}))
 	})
 
 	t.Run("should use digest from buildah when input has no digest", func(t *testing.T) {
@@ -2875,10 +2926,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		resolved, err := c.resolveBaseImages([]string{"namespace/image:tag"})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image:tag"}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image:tag@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image:tag@" + digestA}}))
 	})
 
 	t.Run("should handle tag+digest with non-normalized name", func(t *testing.T) {
@@ -2895,10 +2946,10 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 		}
 
 		// Non-normalized name with tag and digest — both from input
-		resolved, err := c.resolveBaseImages([]string{"namespace/image:my-tag@" + digestA})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image:my-tag@" + digestA}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{"registry.io/namespace/image:my-tag@" + digestA}))
+		g.Expect(resolved).To(Equal([]BaseImage{{Ref: "registry.io/namespace/image:my-tag@" + digestA}}))
 	})
 
 	t.Run("should resolve multiple images", func(t *testing.T) {
@@ -2922,12 +2973,12 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		resolved, err := c.resolveBaseImages([]string{"namespace/image-a:tag", "namespace/image-b:tag"})
+		resolved, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image-a:tag"}, {Ref: "namespace/image-b:tag"}})
 
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(resolved).To(Equal([]string{
-			"registry.io/namespace/image-a:tag@" + digestA,
-			"registry.io/namespace/image-b:tag@" + digestB,
+		g.Expect(resolved).To(Equal([]BaseImage{
+			{Ref: "registry.io/namespace/image-a:tag@" + digestA},
+			{Ref: "registry.io/namespace/image-b:tag@" + digestB},
 		}))
 	})
 
@@ -2942,7 +2993,7 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		_, err := c.resolveBaseImages([]string{"namespace/image:tag"})
+		_, err := c.resolveBaseImages([]BaseImage{{Ref: "namespace/image:tag"}})
 
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("buildah images namespace/image:tag"))
@@ -2954,7 +3005,7 @@ func Test_Build_resolveBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		_, err := c.resolveBaseImages([]string{"registry.io/imAge:tag"})
+		_, err := c.resolveBaseImages([]BaseImage{{Ref: "registry.io/imAge:tag"}})
 
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("parsing registry.io/imAge:tag"))
@@ -2982,7 +3033,7 @@ func Test_Build_writeResolvedBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		err := c.writeResolvedBaseImages([]string{"namespace/image:tag"}, outputPath)
+		err := c.writeResolvedBaseImages([]BaseImage{{Ref: "namespace/image:tag"}}, outputPath)
 
 		g.Expect(err).ToNot(HaveOccurred())
 		content, readErr := os.ReadFile(outputPath)
@@ -3020,7 +3071,7 @@ func Test_Build_writeResolvedBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		err := c.writeResolvedBaseImages([]string{"namespace/image:tag"}, "/tmp/out.txt")
+		err := c.writeResolvedBaseImages([]BaseImage{{Ref: "namespace/image:tag"}}, "/tmp/out.txt")
 
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("determining resolved base images"))
@@ -3039,7 +3090,7 @@ func Test_Build_writeResolvedBaseImages(t *testing.T) {
 			Params:      &BuildParams{},
 		}
 
-		err := c.writeResolvedBaseImages([]string{"namespace/image:tag"}, "/nonexistent/directory/output.txt")
+		err := c.writeResolvedBaseImages([]BaseImage{{Ref: "namespace/image:tag"}}, "/nonexistent/directory/output.txt")
 
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(err.Error()).To(ContainSubstring("writing resolved base images"))
